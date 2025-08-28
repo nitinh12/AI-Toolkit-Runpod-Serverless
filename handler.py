@@ -29,26 +29,115 @@ class TrainingHandler:
         self.training_dir = self.workspace / "training"
         self.training_dir.mkdir(exist_ok=True)
         
-        # Auto-discover the correct training script path
-        self.toolkit_script = self._find_training_script()
+        # Comprehensive diagnostics
+        self.toolkit_info = self._comprehensive_toolkit_discovery()
 
-    def _find_training_script(self):
-        """Find the correct path to the AI toolkit training script"""
-        possible_paths = [
+    def _comprehensive_toolkit_discovery(self):
+        """Comprehensive AI toolkit discovery"""
+        logger.info("=== COMPREHENSIVE TOOLKIT DISCOVERY ===")
+        
+        info = {
+            "found_scripts": [],
+            "found_directories": [],
+            "python_modules": [],
+            "executable_files": []
+        }
+        
+        # 1. Search for Python scripts
+        possible_script_paths = [
             "/app/ai-toolkit/toolkit/train.py",
             "/app/ai-toolkit/train.py", 
             "/app/toolkit/train.py",
-            "/usr/local/bin/train.py"
+            "/app/ai-toolkit/scripts/train.py",
+            "/app/train.py",
+            "/usr/local/bin/train.py",
+            "/opt/ai-toolkit/train.py"
         ]
         
-        for path in possible_paths:
+        for path in possible_script_paths:
             if os.path.exists(path):
-                logger.info(f"Found training script at: {path}")
-                return path
+                info["found_scripts"].append(path)
+                logger.info(f"✅ Found script: {path}")
         
-        # If not found, try alternative approach
-        logger.info("Training script not found, trying directory-based approach")
-        return "/app/ai-toolkit"
+        # 2. Search for directories
+        possible_dirs = [
+            "/app/ai-toolkit",
+            "/app/toolkit", 
+            "/opt/ai-toolkit",
+            "/usr/local/ai-toolkit"
+        ]
+        
+        for dir_path in possible_dirs:
+            if os.path.exists(dir_path):
+                info["found_directories"].append(dir_path)
+                logger.info(f"✅ Found directory: {dir_path}")
+                
+                # List contents
+                try:
+                    contents = list(Path(dir_path).rglob("*.py"))[:10]  # First 10 .py files
+                    logger.info(f"   Python files: {[str(f) for f in contents]}")
+                except Exception as e:
+                    logger.info(f"   Error listing contents: {e}")
+        
+        # 3. Try to find train.py anywhere
+        logger.info("Searching for train.py files...")
+        try:
+            result = subprocess.run(
+                ["find", "/", "-name", "train.py", "-type", "f", "2>/dev/null"], 
+                capture_output=True, text=True, timeout=10
+            )
+            train_files = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            info["found_scripts"].extend([f for f in train_files if f not in info["found_scripts"]])
+            logger.info(f"✅ Found train.py files: {train_files}")
+        except Exception as e:
+            logger.info(f"❌ Find command failed: {e}")
+        
+        # 4. Check if toolkit can be imported as a module
+        try:
+            import sys
+            sys.path.append('/app/ai-toolkit')
+            import toolkit
+            info["python_modules"].append("toolkit (via /app/ai-toolkit)")
+            logger.info("✅ Can import toolkit module")
+        except Exception as e:
+            logger.info(f"❌ Cannot import toolkit: {e}")
+        
+        # 5. Check for executable files
+        executable_paths = [
+            "/app/ai-toolkit/run_training.sh",
+            "/app/ai-toolkit/toolkit.py",
+            "/usr/local/bin/ai-toolkit",
+            "/usr/local/bin/toolkit"
+        ]
+        
+        for path in executable_paths:
+            if os.path.exists(path) and os.access(path, os.X_OK):
+                info["executable_files"].append(path)
+                logger.info(f"✅ Found executable: {path}")
+        
+        # 6. Check what's in /app/ai-toolkit specifically
+        if os.path.exists("/app/ai-toolkit"):
+            logger.info("=== /app/ai-toolkit directory structure ===")
+            try:
+                for root, dirs, files in os.walk("/app/ai-toolkit"):
+                    level = root.replace("/app/ai-toolkit", "").count(os.sep)
+                    indent = " " * 2 * level
+                    logger.info(f"{indent}{os.path.basename(root)}/")
+                    subindent = " " * 2 * (level + 1)
+                    for file in files[:5]:  # First 5 files per directory
+                        logger.info(f"{subindent}{file}")
+                    if len(files) > 5:
+                        logger.info(f"{subindent}... and {len(files) - 5} more files")
+            except Exception as e:
+                logger.info(f"Error exploring directory: {e}")
+        
+        logger.info(f"=== DISCOVERY SUMMARY ===")
+        logger.info(f"Scripts found: {info['found_scripts']}")
+        logger.info(f"Directories found: {info['found_directories']}")
+        logger.info(f"Python modules: {info['python_modules']}")
+        logger.info(f"Executables: {info['executable_files']}")
+        
+        return info
 
     def download_dataset(self, bucket_name: str, dataset_folder: str, local_path: Path):
         logger.info(f"Downloading dataset from {bucket_name}/{dataset_folder}")
@@ -128,111 +217,20 @@ class TrainingHandler:
                      upload_config: Dict[str, Any]) -> Dict[str, Any]:
         session_id = None
         try:
-            session_id = f"training_{int(time.time())}"
-            session_dir = self.training_dir / session_id
-            session_dir.mkdir(exist_ok=True)
-            logger.info(f"Created training session: {session_id}")
-
-            dataset_local_path = session_dir / "dataset"
-            self.download_dataset(
-                dataset_config['bucket_name'],
-                dataset_config['folder_path'],
-                dataset_local_path
-            )
-
-            config = yaml.safe_load(config_content)
-            if 'config' in config and 'process' in config['config']:
-                for process_item in config['config']['process']:
-                    if 'datasets' in process_item:
-                        for dataset in process_item['datasets']:
-                            if 'folder_path' in dataset:
-                                dataset['folder_path'] = str(dataset_local_path)
-
-            output_dir = session_dir / "outputs"
-            output_dir.mkdir(exist_ok=True)
-
-            if 'config' in config and 'process' in config['config']:
-                for process_item in config['config']['process']:
-                    if 'save' in process_item:
-                        process_item['save']['save_dir'] = str(output_dir)
-                    else:
-                        process_item['save'] = {'save_dir': str(output_dir)}
-
-            config_file = session_dir / "training_config.yaml"
-            with open(config_file, 'w') as f:
-                yaml.dump(config, f, default_flow_style=False)
-
-            logger.info(f"Starting training with config: {config_file}")
-            logger.info(f"Dataset path: {dataset_local_path}")
-            logger.info(f"Output directory: {output_dir}")
-
-            monitor_thread = threading.Thread(
-                target=self.monitor_and_upload_outputs,
-                args=(output_dir, upload_config['bucket_name'], upload_config['folder_path']),
-                daemon=True
-            )
-            monitor_thread.start()
-
-            # Improved command construction with multiple fallback approaches
-            if self.toolkit_script.endswith('.py'):
-                cmd = ["python", self.toolkit_script, "--config", str(config_file)]
-            else:
-                # Try running from the toolkit directory
-                cmd = ["python", "-m", "train", "--config", str(config_file)]
-                # Change to the toolkit directory
-                os.chdir(self.toolkit_script)
-
-            logger.info(f"Executing command: {' '.join(cmd)}")
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-
-            output_lines = []
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                if output:
-                    line = output.strip()
-                    output_lines.append(line)
-                    logger.info(f"TRAINING: {line}")
-
-            return_code = process.poll()
-
-            logger.info("Training completed, uploading final files...")
-            time.sleep(10)
-
-            self.upload_file_to_supabase(
-                config_file,
-                upload_config['bucket_name'],
-                f"{upload_config['folder_path']}/config/training_config.yaml"
-            )
-
-            result = {
-                "success": return_code == 0,
-                "return_code": return_code,
-                "session_id": session_id,
-                "output_lines": output_lines[-50:],
-                "total_output_lines": len(output_lines),
-                "output_dir": str(output_dir),
-                "uploaded_to": f"{upload_config['bucket_name']}/{upload_config['folder_path']}"
+            # First, return the diagnostic information
+            return {
+                "success": False,
+                "diagnostic_info": self.toolkit_info,
+                "message": "This is a diagnostic run. Check the logs for detailed discovery information.",
+                "next_steps": "Based on the discovered files, we'll create the correct training command."
             }
-
-            logger.info(f"Training completed with return code: {return_code}")
-            return result
-
+            
         except Exception as e:
-            logger.error(f"Error in training: {str(e)}")
+            logger.error(f"Error in diagnostics: {str(e)}")
             return {
                 "success": False,
                 "error": str(e),
-                "session_id": session_id if session_id else None
+                "diagnostic_info": self.toolkit_info
             }
 
 def handler(event):
