@@ -28,6 +28,27 @@ class TrainingHandler:
         self.workspace = Path("/workspace")
         self.training_dir = self.workspace / "training"
         self.training_dir.mkdir(exist_ok=True)
+        
+        # Auto-discover the correct training script path
+        self.toolkit_script = self._find_training_script()
+
+    def _find_training_script(self):
+        """Find the correct path to the AI toolkit training script"""
+        possible_paths = [
+            "/app/ai-toolkit/toolkit/train.py",
+            "/app/ai-toolkit/train.py", 
+            "/app/toolkit/train.py",
+            "/usr/local/bin/train.py"
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                logger.info(f"Found training script at: {path}")
+                return path
+        
+        # If not found, try alternative approach
+        logger.info("Training script not found, trying directory-based approach")
+        return "/app/ai-toolkit"
 
     def download_dataset(self, bucket_name: str, dataset_folder: str, local_path: Path):
         logger.info(f"Downloading dataset from {bucket_name}/{dataset_folder}")
@@ -152,13 +173,14 @@ class TrainingHandler:
             )
             monitor_thread.start()
 
-            # Modified section: call the AI Toolkit train module by direct script path
-            # from /app/ai-toolkit/toolkit/train.py using python
-            toolkit_path = "/app/ai-toolkit/toolkit/train.py"
-            cmd = [
-                "python", toolkit_path,
-                "--config", str(config_file)
-            ]
+            # Improved command construction with multiple fallback approaches
+            if self.toolkit_script.endswith('.py'):
+                cmd = ["python", self.toolkit_script, "--config", str(config_file)]
+            else:
+                # Try running from the toolkit directory
+                cmd = ["python", "-m", "train", "--config", str(config_file)]
+                # Change to the toolkit directory
+                os.chdir(self.toolkit_script)
 
             logger.info(f"Executing command: {' '.join(cmd)}")
 
@@ -196,7 +218,7 @@ class TrainingHandler:
                 "success": return_code == 0,
                 "return_code": return_code,
                 "session_id": session_id,
-                "output_lines": output_lines[-50:],  # Last 50 lines
+                "output_lines": output_lines[-50:],
                 "total_output_lines": len(output_lines),
                 "output_dir": str(output_dir),
                 "uploaded_to": f"{upload_config['bucket_name']}/{upload_config['folder_path']}"
