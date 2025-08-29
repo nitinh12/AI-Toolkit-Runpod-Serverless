@@ -50,17 +50,46 @@ class FileUploadHandler(FileSystemEventHandler):
         self.output_dir = Path(output_dir)
         self.bucket_name = bucket_name
         self.upload_folder = upload_folder
-        self.last_upload_times = {}
-        self.upload_delay = 3  # seconds to avoid duplicate uploads
+        self.file_states = {}  # Track file size and modification time
+        self.uploaded_files = set()  # Track already uploaded files
+        self.upload_delay = 5  # seconds to wait for file stability
         
-    def can_upload_file(self, file_path):
-        """Check if enough time has passed since last upload attempt"""
-        now = time.time()
-        last_time = self.last_upload_times.get(str(file_path), 0)
-        if now - last_time > self.upload_delay:
-            self.last_upload_times[str(file_path)] = now
-            return True
-        return False
+    def is_file_stable(self, file_path):
+        """Check if file has stopped changing"""
+        try:
+            stat = file_path.stat()
+            current_size = stat.st_size
+            current_mtime = stat.st_mtime
+            
+            # Get previous state
+            prev_state = self.file_states.get(str(file_path))
+            
+            if prev_state is None:
+                # First time seeing this file
+                self.file_states[str(file_path)] = {
+                    'size': current_size,
+                    'mtime': current_mtime,
+                    'last_check': time.time()
+                }
+                return False
+            
+            # Check if file has changed since last check
+            if (current_size != prev_state['size'] or 
+                current_mtime != prev_state['mtime']):
+                # File is still changing
+                self.file_states[str(file_path)] = {
+                    'size': current_size,
+                    'mtime': current_mtime,
+                    'last_check': time.time()
+                }
+                return False
+            
+            # Check if enough time has passed since last change
+            time_since_change = time.time() - prev_state['last_check']
+            return time_since_change >= self.upload_delay
+            
+        except (OSError, FileNotFoundError):
+            return False
         
     def on_created(self, event):
         if not event.is_directory:
@@ -72,52 +101,48 @@ class FileUploadHandler(FileSystemEventHandler):
             
     def handle_file(self, file_path):
         try:
-            # Longer delay for large files like checkpoints
-            if file_path.suffix == '.safetensors':
-                logger.info(f"🔍 DETECTED CHECKPOINT: {file_path.name} - waiting for write completion...")
-                time.sleep(10)  # Longer wait for checkpoint files
-            else:
-                time.sleep(2)
-            
             if not file_path.exists():
-                logger.warning(f"⚠️ FILE DISAPPEARED: {file_path}")
+                return
+                
+            # Skip config files
+            if file_path.name == 'config.yaml':
+                return
+            
+            # Skip if already uploaded
+            if str(file_path) in self.uploaded_files:
+                return
+            
+            # Check if file is stable (not being written to)
+            if not self.is_file_stable(file_path):
+                logger.info(f"⏳ FILE STILL CHANGING: {file_path.name}")
                 return
                 
             # Check file has meaningful content
             file_size = file_path.stat().st_size
             if file_size == 0:
-                logger.warning(f"⚠️ EMPTY FILE: {file_path}")
+                logger.warning(f"⚠️ EMPTY FILE: {file_path.name}")
                 return
             
-            logger.info(f"📁 FILE READY: {file_path.name} ({file_size / 1024 / 1024:.1f}MB)")
+            logger.info(f"📁 FILE READY FOR UPLOAD: {file_path.name} ({file_size / 1024 / 1024:.1f}MB)")
             
-            # Skip config files
-            if file_path.name == 'config.yaml':
-                logger.info(f"⏭️ SKIPPED CONFIG: {file_path.name}")
-                return
-                
-            # Avoid duplicate uploads using time-based filtering
-            if not self.can_upload_file(file_path):
-                logger.info(f"⏭️ SKIPPED DUPLICATE: {file_path.name}")
-                return
-                
             # Calculate relative path from output directory
             try:
                 relative_path = file_path.relative_to(self.output_dir)
                 remote_path = f"{self.upload_folder}/{relative_path}"
-                
-                # Convert Windows paths to forward slashes for Supabase
                 remote_path = remote_path.replace('\\', '/')
                 
-                logger.info(f"⬆️ UPLOADING: {relative_path} ({file_size / 1024 / 1024:.1f}MB)")
+                logger.info(f"⬆️ UPLOADING: {relative_path}")
                 
                 if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
-                    logger.info(f"✅ REAL-TIME UPLOAD SUCCESS: {relative_path}")
+                    logger.info(f"✅ UPLOAD SUCCESS: {relative_path}")
+                    # Mark as uploaded to prevent re-upload
+                    self.uploaded_files.add(str(file_path))
+                    # Remove from tracking
+                    self.file_states.pop(str(file_path), None)
                 else:
                     logger.error(f"❌ UPLOAD FAILED: {relative_path}")
                     
             except ValueError:
-                # File is not within output directory, skip it
                 logger.warning(f"⚠️ FILE OUTSIDE OUTPUT DIR: {file_path}")
                 return
                     
