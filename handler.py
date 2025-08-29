@@ -62,7 +62,7 @@ class FileUploadHandler(FileSystemEventHandler):
 
     def handle_file(self, file_path):
         try:
-            time.sleep(2)  # Let file finish writing
+            time.sleep(2)  # Basic delay to let file finish writing
             if not file_path.exists():
                 return
             if file_path.name == 'config.yaml':
@@ -157,7 +157,7 @@ class TrainingHandler:
             return False
 
     def setup_realtime_file_watcher(self, output_dir: Path, bucket_name: str, upload_folder: str):
-        logger.info(f"Setting up real-time file watcher for {output_dir}")
+        # Removed the log about setting up real-time watcher
         event_handler = FileUploadHandler(self, output_dir, bucket_name, upload_folder)
         observer = Observer()
         observer.schedule(event_handler, str(output_dir), recursive=True)
@@ -196,18 +196,27 @@ class TrainingHandler:
                     process['training_folder'] = str(output_dir)
             with open(config_file, 'w') as f:
                 yaml.dump(config_data, f, default_flow_style=False)
+            
             file_observer = self.setup_realtime_file_watcher(
                 output_dir,
                 upload_config["bucket_name"],
                 upload_config["folder_path"]
             )
+            
             cmd = ["python", str(self.run_script), str(config_file)]
             logger.info(f"Starting training: {' '.join(cmd)}")
             original_cwd = os.getcwd()
             os.chdir(str(self.ai_toolkit_dir))
             try:
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
-                logger.info("Training process started with real-time file upload monitoring")
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                logger.info("Training process started")
                 while True:
                     output = process.stdout.readline()
                     if output == '' and process.poll() is not None:
@@ -243,7 +252,6 @@ class TrainingHandler:
             finally:
                 os.chdir(original_cwd)
                 if file_observer:
-                    logger.info("Stopping file watcher")
                     file_observer.stop()
                     file_observer.join()
         except Exception as e:
