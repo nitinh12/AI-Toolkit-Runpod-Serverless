@@ -186,45 +186,6 @@ class TrainingHandler:
         
         return observer
 
-    def upload_remaining_files(self, output_dir: Path, bucket_name: str, upload_folder: str):
-        """Upload any files that might have been missed by the watcher"""
-        logger.info(f"📤 Checking for any remaining files to upload...")
-        
-        uploaded_count = 0
-        failed_count = 0
-        skipped_count = 0
-        
-        for file_path in output_dir.rglob('*'):
-            if file_path.is_file():
-                # Skip config files
-                if file_path.name == 'config.yaml':
-                    skipped_count += 1
-                    continue
-                    
-                try:
-                    relative_path = file_path.relative_to(output_dir)
-                    remote_path = f"{upload_folder}/{relative_path}"
-                    remote_path = remote_path.replace('\\', '/')
-                    
-                    # Try to upload (will update if already exists)
-                    if self.upload_file_to_supabase(file_path, bucket_name, remote_path):
-                        uploaded_count += 1
-                        logger.info(f"✅ FINAL UPLOAD: {relative_path}")
-                    else:
-                        failed_count += 1
-                        logger.warning(f"⚠️ FINAL FAILED: {relative_path}")
-                        
-                except Exception as e:
-                    failed_count += 1
-                    logger.error(f"❌ ERROR uploading {file_path}: {str(e)}")
-        
-        if uploaded_count > 0 or failed_count > 0:
-            logger.info(f"📊 Final upload check: {uploaded_count} uploaded, {failed_count} failed, {skipped_count} skipped")
-        else:
-            logger.info(f"📊 No additional files to upload - real-time upload worked perfectly!")
-        
-        return uploaded_count, failed_count
-
     def run_training(self, config_content: str, dataset_config: Dict[str, Any], 
                     upload_config: Dict[str, Any]) -> Dict[str, Any]:
         session_id = None
@@ -323,26 +284,13 @@ class TrainingHandler:
                 if return_code == 0:
                     logger.info("🎉 Training completed successfully!")
                     
-                    # Wait a bit for any final file operations
-                    logger.info("⏳ Waiting for final file operations...")
-                    time.sleep(10)
-                    
-                    # Check for any files that might have been missed
-                    uploaded_count, failed_count = self.upload_remaining_files(
-                        output_dir,
-                        upload_config["bucket_name"],
-                        upload_config["folder_path"]
-                    )
-                    
                     return {
                         "success": True,
                         "message": "Training completed successfully with real-time file uploads",
                         "session_id": session_id,
                         "model_name": model_name,
                         "upload_folder": upload_config["folder_path"],
-                        "output_path": str(output_dir),
-                        "additional_files_uploaded": uploaded_count,
-                        "upload_failures": failed_count
+                        "output_path": str(output_dir)
                     }
                 else:
                     logger.error(f"❌ Training failed with return code: {return_code}")
