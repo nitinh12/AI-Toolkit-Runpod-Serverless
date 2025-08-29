@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, Any
 import runpod
 from supabase import create_client, Client
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # Configure logging to output everything to stdout/stderr (which goes to worker logs)
 logging.basicConfig(
@@ -41,6 +43,72 @@ def extract_model_name_from_config(config_content: str) -> str:
     except Exception as e:
         logger.warning(f"Could not extract model name from config: {e}")
         return 'default_model'
+
+class FileUploadHandler(FileSystemEventHandler):
+    def __init__(self, training_handler, output_dir, bucket_name, upload_folder):
+        self.training_handler = training_handler
+        self.output_dir = Path(output_dir)
+        self.bucket_name = bucket_name
+        self.upload_folder = upload_folder
+        self.last_upload_times = {}
+        self.upload_delay = 3  # seconds to avoid duplicate uploads
+        
+    def can_upload_file(self, file_path):
+        """Check if enough time has passed since last upload attempt"""
+        now = time.time()
+        last_time = self.last_upload_times.get(str(file_path), 0)
+        if now - last_time > self.upload_delay:
+            self.last_upload_times[str(file_path)] = now
+            return True
+        return False
+        
+    def on_created(self, event):
+        if not event.is_directory:
+            self.handle_file(Path(event.src_path))
+    
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.handle_file(Path(event.src_path))
+            
+    def handle_file(self, file_path):
+        try:
+            # Small delay to ensure file is fully written
+            time.sleep(2)
+            
+            if not file_path.exists():
+                return
+                
+            # Check file has meaningful content
+            if file_path.stat().st_size == 0:
+                return
+            
+            # Skip config files
+            if file_path.name == 'config.yaml':
+                return
+                
+            # Avoid duplicate uploads using time-based filtering
+            if not self.can_upload_file(file_path):
+                return
+                
+            # Calculate relative path from output directory
+            try:
+                relative_path = file_path.relative_to(self.output_dir)
+                remote_path = f"{self.upload_folder}/{relative_path}"
+                
+                # Convert Windows paths to forward slashes for Supabase
+                remote_path = remote_path.replace('\\', '/')
+                
+                if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
+                    logger.info(f"✅ REAL-TIME UPLOAD: {relative_path}")
+                else:
+                    logger.warning(f"⚠️ UPLOAD FAILED: {relative_path}")
+                    
+            except ValueError:
+                # File is not within output directory, skip it
+                return
+                    
+        except Exception as e:
+            logger.error(f"❌ UPLOAD ERROR for {file_path}: {str(e)}")
 
 class TrainingHandler:
     def __init__(self):
@@ -107,48 +175,60 @@ class TrainingHandler:
             logger.error(f"❌ Upload error for {local_file}: {str(e)}")
             return False
 
-    def upload_output_folder(self, output_dir: Path, bucket_name: str, upload_folder: str):
-        """Upload all files from output directory except config.yaml"""
-        logger.info(f"📤 Starting upload of all files from {output_dir} (excluding config.yaml)")
+    def setup_realtime_file_watcher(self, output_dir: Path, bucket_name: str, upload_folder: str):
+        """Set up file watcher for real-time uploads"""
+        logger.info(f"👀 Setting up real-time file watcher for {output_dir}")
+        
+        event_handler = FileUploadHandler(self, output_dir, bucket_name, upload_folder)
+        observer = Observer()
+        observer.schedule(event_handler, str(output_dir), recursive=True)
+        observer.start()
+        
+        return observer
+
+    def upload_remaining_files(self, output_dir: Path, bucket_name: str, upload_folder: str):
+        """Upload any files that might have been missed by the watcher"""
+        logger.info(f"📤 Checking for any remaining files to upload...")
         
         uploaded_count = 0
         failed_count = 0
         skipped_count = 0
         
-        # Walk through all files in output directory recursively
         for file_path in output_dir.rglob('*'):
             if file_path.is_file():
-                # Skip config.yaml files
+                # Skip config files
                 if file_path.name == 'config.yaml':
                     skipped_count += 1
-                    logger.info(f"⏭️ SKIPPED: {file_path.name} (config file)")
                     continue
                     
                 try:
-                    # Calculate relative path from output directory
                     relative_path = file_path.relative_to(output_dir)
                     remote_path = f"{upload_folder}/{relative_path}"
-                    
-                    # Convert Windows paths to forward slashes for Supabase
                     remote_path = remote_path.replace('\\', '/')
                     
+                    # Try to upload (will update if already exists)
                     if self.upload_file_to_supabase(file_path, bucket_name, remote_path):
                         uploaded_count += 1
-                        logger.info(f"✅ UPLOADED: {relative_path}")
+                        logger.info(f"✅ FINAL UPLOAD: {relative_path}")
                     else:
                         failed_count += 1
-                        logger.warning(f"⚠️ FAILED: {relative_path}")
+                        logger.warning(f"⚠️ FINAL FAILED: {relative_path}")
                         
                 except Exception as e:
                     failed_count += 1
                     logger.error(f"❌ ERROR uploading {file_path}: {str(e)}")
         
-        logger.info(f"📊 Upload complete: {uploaded_count} successful, {failed_count} failed, {skipped_count} skipped")
+        if uploaded_count > 0 or failed_count > 0:
+            logger.info(f"📊 Final upload check: {uploaded_count} uploaded, {failed_count} failed, {skipped_count} skipped")
+        else:
+            logger.info(f"📊 No additional files to upload - real-time upload worked perfectly!")
+        
         return uploaded_count, failed_count
 
     def run_training(self, config_content: str, dataset_config: Dict[str, Any], 
                     upload_config: Dict[str, Any]) -> Dict[str, Any]:
         session_id = None
+        file_observer = None
         
         try:
             model_name = extract_model_name_from_config(config_content)
@@ -192,6 +272,13 @@ class TrainingHandler:
             with open(config_file, 'w') as f:
                 yaml.dump(config_data, f, default_flow_style=False)
             
+            # Setup real-time file watcher BEFORE starting training
+            file_observer = self.setup_realtime_file_watcher(
+                output_dir,
+                upload_config["bucket_name"],
+                upload_config["folder_path"]
+            )
+            
             cmd = [
                 "python", str(self.run_script),
                 str(config_file)
@@ -213,7 +300,7 @@ class TrainingHandler:
                     universal_newlines=True
                 )
                 
-                logger.info("✅ Training process started")
+                logger.info("✅ Training process started with real-time file upload monitoring")
                 
                 # Stream EVERY line to worker logs
                 while True:
@@ -236,9 +323,12 @@ class TrainingHandler:
                 if return_code == 0:
                     logger.info("🎉 Training completed successfully!")
                     
-                    # Upload all files from output directory (except config.yaml)
-                    logger.info("📤 Uploading all output files...")
-                    uploaded_count, failed_count = self.upload_output_folder(
+                    # Wait a bit for any final file operations
+                    logger.info("⏳ Waiting for final file operations...")
+                    time.sleep(10)
+                    
+                    # Check for any files that might have been missed
+                    uploaded_count, failed_count = self.upload_remaining_files(
                         output_dir,
                         upload_config["bucket_name"],
                         upload_config["folder_path"]
@@ -246,13 +336,13 @@ class TrainingHandler:
                     
                     return {
                         "success": True,
-                        "message": "Training completed successfully",
+                        "message": "Training completed successfully with real-time file uploads",
                         "session_id": session_id,
                         "model_name": model_name,
                         "upload_folder": upload_config["folder_path"],
                         "output_path": str(output_dir),
-                        "files_uploaded": uploaded_count,
-                        "files_failed": failed_count
+                        "additional_files_uploaded": uploaded_count,
+                        "upload_failures": failed_count
                     }
                 else:
                     logger.error(f"❌ Training failed with return code: {return_code}")
@@ -264,9 +354,15 @@ class TrainingHandler:
                     
             finally:
                 os.chdir(original_cwd)
+                if file_observer:
+                    file_observer.stop()
+                    file_observer.join()
                     
         except Exception as e:
             logger.error(f"❌ Error in training process: {str(e)}")
+            if file_observer:
+                file_observer.stop()
+                file_observer.join()
             return {
                 "success": False,
                 "error": str(e),
