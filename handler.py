@@ -108,15 +108,22 @@ class TrainingHandler:
             return False
 
     def upload_output_folder(self, output_dir: Path, bucket_name: str, upload_folder: str):
-        """Upload all files from output directory maintaining folder structure"""
-        logger.info(f"📤 Starting upload of all files from {output_dir}")
+        """Upload all files from output directory except config.yaml"""
+        logger.info(f"📤 Starting upload of all files from {output_dir} (excluding config.yaml)")
         
         uploaded_count = 0
         failed_count = 0
+        skipped_count = 0
         
         # Walk through all files in output directory recursively
         for file_path in output_dir.rglob('*'):
             if file_path.is_file():
+                # Skip config.yaml files
+                if file_path.name == 'config.yaml':
+                    skipped_count += 1
+                    logger.info(f"⏭️ SKIPPED: {file_path.name} (config file)")
+                    continue
+                    
                 try:
                     # Calculate relative path from output directory
                     relative_path = file_path.relative_to(output_dir)
@@ -136,7 +143,7 @@ class TrainingHandler:
                     failed_count += 1
                     logger.error(f"❌ ERROR uploading {file_path}: {str(e)}")
         
-        logger.info(f"📊 Upload complete: {uploaded_count} successful, {failed_count} failed")
+        logger.info(f"📊 Upload complete: {uploaded_count} successful, {failed_count} failed, {skipped_count} skipped")
         return uploaded_count, failed_count
 
     def run_training(self, config_content: str, dataset_config: Dict[str, Any], 
@@ -229,7 +236,7 @@ class TrainingHandler:
                 if return_code == 0:
                     logger.info("🎉 Training completed successfully!")
                     
-                    # Upload all files from output directory
+                    # Upload all files from output directory (except config.yaml)
                     logger.info("📤 Uploading all output files...")
                     uploaded_count, failed_count = self.upload_output_folder(
                         output_dir,
