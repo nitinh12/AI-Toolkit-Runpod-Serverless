@@ -72,22 +72,33 @@ class FileUploadHandler(FileSystemEventHandler):
             
     def handle_file(self, file_path):
         try:
-            # Small delay to ensure file is fully written
-            time.sleep(2)
+            # Longer delay for large files like checkpoints
+            if file_path.suffix == '.safetensors':
+                logger.info(f"🔍 DETECTED CHECKPOINT: {file_path.name} - waiting for write completion...")
+                time.sleep(10)  # Longer wait for checkpoint files
+            else:
+                time.sleep(2)
             
             if not file_path.exists():
+                logger.warning(f"⚠️ FILE DISAPPEARED: {file_path}")
                 return
                 
             # Check file has meaningful content
-            if file_path.stat().st_size == 0:
+            file_size = file_path.stat().st_size
+            if file_size == 0:
+                logger.warning(f"⚠️ EMPTY FILE: {file_path}")
                 return
+            
+            logger.info(f"📁 FILE READY: {file_path.name} ({file_size / 1024 / 1024:.1f}MB)")
             
             # Skip config files
             if file_path.name == 'config.yaml':
+                logger.info(f"⏭️ SKIPPED CONFIG: {file_path.name}")
                 return
                 
             # Avoid duplicate uploads using time-based filtering
             if not self.can_upload_file(file_path):
+                logger.info(f"⏭️ SKIPPED DUPLICATE: {file_path.name}")
                 return
                 
             # Calculate relative path from output directory
@@ -98,13 +109,16 @@ class FileUploadHandler(FileSystemEventHandler):
                 # Convert Windows paths to forward slashes for Supabase
                 remote_path = remote_path.replace('\\', '/')
                 
+                logger.info(f"⬆️ UPLOADING: {relative_path} ({file_size / 1024 / 1024:.1f}MB)")
+                
                 if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
-                    logger.info(f"✅ REAL-TIME UPLOAD: {relative_path}")
+                    logger.info(f"✅ REAL-TIME UPLOAD SUCCESS: {relative_path}")
                 else:
-                    logger.warning(f"⚠️ UPLOAD FAILED: {relative_path}")
+                    logger.error(f"❌ UPLOAD FAILED: {relative_path}")
                     
             except ValueError:
                 # File is not within output directory, skip it
+                logger.warning(f"⚠️ FILE OUTSIDE OUTPUT DIR: {file_path}")
                 return
                     
         except Exception as e:
@@ -150,23 +164,31 @@ class TrainingHandler:
             raise
 
     def upload_file_to_supabase(self, local_file: Path, bucket_name: str, remote_path: str):
-        """Simple upload without size checking"""
+        """Upload with better error handling"""
         try:
+            file_size = local_file.stat().st_size
+            logger.info(f"📤 Starting upload: {local_file.name} ({file_size / 1024 / 1024:.1f}MB)")
+            
             with open(local_file, 'rb') as f:
                 file_data = f.read()
 
             try:
+                # First try to upload
                 response = self.supabase.storage.from_(bucket_name).upload(
                     remote_path, file_data,
                     file_options={"content-type": "application/octet-stream"}
                 )
+                logger.info(f"✅ Upload successful: {local_file.name}")
                 return True
             except Exception as upload_error:
-                if "already exists" in str(upload_error).lower():
+                error_str = str(upload_error).lower()
+                if "already exists" in error_str or "400" in error_str:
+                    logger.info(f"🔄 File exists, updating: {local_file.name}")
                     response = self.supabase.storage.from_(bucket_name).update(
                         remote_path, file_data,
                         file_options={"content-type": "application/octet-stream"}
                     )
+                    logger.info(f"✅ Update successful: {local_file.name}")
                     return True
                 else:
                     raise upload_error
@@ -284,6 +306,10 @@ class TrainingHandler:
                 if return_code == 0:
                     logger.info("🎉 Training completed successfully!")
                     
+                    # Give file watcher extra time to catch final files
+                    logger.info("⏳ Waiting for final file uploads...")
+                    time.sleep(15)
+                    
                     return {
                         "success": True,
                         "message": "Training completed successfully with real-time file uploads",
@@ -303,6 +329,7 @@ class TrainingHandler:
             finally:
                 os.chdir(original_cwd)
                 if file_observer:
+                    logger.info("🛑 Stopping file watcher...")
                     file_observer.stop()
                     file_observer.join()
                     
