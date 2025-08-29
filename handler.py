@@ -4,6 +4,7 @@ import subprocess
 import logging
 import yaml
 import time
+import sys
 from pathlib import Path
 from typing import Dict, Any
 import runpod
@@ -11,8 +12,14 @@ from supabase import create_client, Client
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# Configure logging to be less verbose but more informative
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging to output everything to stdout/stderr (which goes to worker logs)
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # Ensure logs go to stdout
+    ]
+)
 logger = logging.getLogger(__name__)
 
 def init_supabase_client() -> Client:
@@ -78,11 +85,10 @@ class FileUploadHandler(FileSystemEventHandler):
                 
                 if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
                     self.uploaded_files.add(file_path)
-                    # Only log successful uploads to reduce log verbosity
-                    logger.info(f"✅ UPLOADED: {file_path.name}")
+                    logger.info(f"UPLOADED: {file_path.name} -> {remote_path}")
                     
         except Exception as e:
-            logger.error(f"❌ UPLOAD ERROR: {str(e)}")
+            logger.error(f"UPLOAD ERROR: {str(e)}")
             
     def should_upload(self, file_path):
         upload_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.safetensors', '.log', '.txt', '.yaml', '.yml'}
@@ -102,11 +108,11 @@ class TrainingHandler:
             raise ValueError(f"AI Toolkit not found at expected location: {self.ai_toolkit_dir}")
 
     def download_dataset(self, bucket_name: str, dataset_folder: str, local_path: Path):
-        logger.info(f"📥 Downloading dataset from {bucket_name}/{dataset_folder}")
+        logger.info(f"Downloading dataset from {bucket_name}/{dataset_folder}")
         try:
             files = self.supabase.storage.from_(bucket_name).list(dataset_folder)
             if not files:
-                logger.warning(f"⚠️ No files found in {bucket_name}/{dataset_folder}")
+                logger.warning(f"No files found in {bucket_name}/{dataset_folder}")
                 return
 
             local_path.mkdir(parents=True, exist_ok=True)
@@ -121,10 +127,11 @@ class TrainingHandler:
                     with open(local_file_path, 'wb') as f:
                         f.write(response)
                     download_count += 1
+                    logger.info(f"Downloaded: {file_info['name']} ({download_count}/{len(files)})")
             
-            logger.info(f"✅ Dataset download completed: {download_count} files")
+            logger.info(f"Dataset download completed: {download_count} files downloaded")
         except Exception as e:
-            logger.error(f"❌ Error downloading dataset: {str(e)}")
+            logger.error(f"Error downloading dataset: {str(e)}")
             raise
 
     def upload_file_to_supabase(self, local_file: Path, bucket_name: str, remote_path: str):
@@ -148,11 +155,11 @@ class TrainingHandler:
 
             return response
         except Exception as e:
-            # Reduce upload error verbosity
+            logger.error(f"Upload error for {local_file}: {str(e)}")
             return None
 
     def setup_realtime_file_watcher(self, output_dir: Path, bucket_name: str, upload_folder: str, model_name: str):
-        logger.info(f"👀 Setting up file monitoring for {output_dir}")
+        logger.info(f"Setting up real-time file watcher for {output_dir}")
         
         event_handler = FileUploadHandler(self, output_dir, bucket_name, upload_folder, model_name)
         observer = Observer()
@@ -160,11 +167,6 @@ class TrainingHandler:
         observer.start()
         
         return observer
-
-    def create_training_log_file(self, session_dir: Path):
-        """Create a dedicated log file for training output"""
-        log_file = session_dir / "training_output.log"
-        return log_file
 
     def run_training(self, config_content: str, dataset_config: Dict[str, Any], 
                     upload_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -177,11 +179,8 @@ class TrainingHandler:
             session_dir = self.training_dir / session_id
             session_dir.mkdir(exist_ok=True)
             
-            logger.info(f"🚀 Starting training session {session_id}")
-            logger.info(f"📋 Model: {model_name}")
-            
-            # Create dedicated log file
-            training_log_file = self.create_training_log_file(session_dir)
+            logger.info(f"Starting training session {session_id}")
+            logger.info(f"Model name: {model_name}")
             
             config_file = session_dir / "config.yaml"
             with open(config_file, 'w') as f:
@@ -225,57 +224,44 @@ class TrainingHandler:
                 str(config_file)
             ]
             
-            logger.info(f"💻 Starting training: {' '.join(cmd)}")
+            logger.info(f"Executing command: {' '.join(cmd)}")
             
             original_cwd = os.getcwd()
             os.chdir(str(self.ai_toolkit_dir))
             
             try:
-                # Write training output to both log file and capture key lines
-                with open(training_log_file, 'w') as log_file:
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True
-                    )
-                    
-                    logger.info("✅ Training process started")
-                    
-                    line_count = 0
-                    important_lines = []
-                    
-                    # Process output line by line
-                    for line in iter(process.stdout.readline, ''):
-                        if line:
-                            line = line.rstrip()
-                            # Write all output to log file
-                            log_file.write(line + '\n')
-                            log_file.flush()
-                            
-                            line_count += 1
-                            
-                            # Only log important lines to RunPod logs to avoid truncation
-                            if any(keyword in line.lower() for keyword in 
-                                  ['error', 'warning', 'epoch', 'step', 'loss', 'checkpoint', 'saved', 'completed']):
-                                logger.info(f"🔥 {line}")
-                                important_lines.append(line)
-                            
-                            # Log progress every 100 lines
-                            if line_count % 100 == 0:
-                                logger.info(f"📊 Training progress: {line_count} lines processed")
-                    
-                    process.wait()
+                # KEY CHANGE: Stream ALL output directly to stdout/stderr in real-time
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
                 
-                # Upload the complete training log
-                log_remote_path = f"{upload_config['folder_path']}/{model_name}/logs/training_output.log"
-                self.upload_file_to_supabase(training_log_file, upload_config["bucket_name"], log_remote_path)
-                logger.info(f"📋 Complete training log uploaded to Supabase")
+                logger.info("Training process started successfully")
                 
-                if process.returncode == 0:
-                    logger.info("🎉 Training completed successfully!")
+                # Stream EVERY line directly to stdout (which goes to worker logs)
+                while True:
+                    output = process.stdout.readline()
+                    if output == '' and process.poll() is not None:
+                        break
+                    if output:
+                        # Print directly to stdout - this goes straight to worker logs
+                        print(output.rstrip(), flush=True)
+                        sys.stdout.flush()  # Force immediate output
+                
+                # Get any remaining output
+                remaining_output = process.stdout.read()
+                if remaining_output:
+                    print(remaining_output, flush=True)
+                    sys.stdout.flush()
+                
+                return_code = process.poll()
+                
+                if return_code == 0:
+                    logger.info("Training completed successfully!")
                     
                     # Wait for final file uploads
                     time.sleep(30)
@@ -286,17 +272,14 @@ class TrainingHandler:
                         "session_id": session_id,
                         "model_name": model_name,
                         "upload_structure": f"{upload_config['folder_path']}/{model_name}/",
-                        "output_path": str(output_dir),
-                        "training_log_uploaded": True,
-                        "important_lines": important_lines[-10:] if important_lines else []  # Last 10 important lines
+                        "output_path": str(output_dir)
                     }
                 else:
-                    logger.error(f"❌ Training failed with return code: {process.returncode}")
+                    logger.error(f"Training failed with return code: {return_code}")
                     return {
                         "success": False,
-                        "error": f"Training process failed with return code {process.returncode}",
-                        "session_id": session_id,
-                        "training_log_uploaded": True
+                        "error": f"Training process failed with return code {return_code}",
+                        "session_id": session_id
                     }
                     
             finally:
@@ -306,7 +289,7 @@ class TrainingHandler:
                     file_observer.join()
                     
         except Exception as e:
-            logger.error(f"❌ Error in training process: {str(e)}")
+            logger.error(f"Error in training process: {str(e)}")
             if file_observer:
                 file_observer.stop()
                 file_observer.join()
@@ -316,80 +299,42 @@ class TrainingHandler:
                 "session_id": session_id if session_id else "unknown"
             }
 
-# Streaming handler for progress updates
 def handler(event):
     input_data = event.get("input", {})
+    logger.info(f"Received training request")
     
-    # Validate required fields
     required_fields = ["config", "dataset_config", "upload_config"]
     for field in required_fields:
         if field not in input_data:
-            yield {"error": f"Missing required field: {field}"}
-            return
+            error_msg = f"Missing required field: {field}"
+            logger.error(error_msg)
+            return {"error": error_msg}
     
     dataset_config = input_data["dataset_config"]
     if not all(k in dataset_config for k in ["bucket_name", "folder_path"]):
-        yield {"error": "dataset_config must contain 'bucket_name' and 'folder_path'"}
-        return
+        error_msg = "dataset_config must contain 'bucket_name' and 'folder_path'"
+        logger.error(error_msg)
+        return {"error": error_msg}
     
     upload_config = input_data["upload_config"]
     if not all(k in upload_config for k in ["bucket_name", "folder_path"]):
-        yield {"error": "upload_config must contain 'bucket_name' and 'folder_path'"}
-        return
+        error_msg = "upload_config must contain 'bucket_name' and 'folder_path'"
+        logger.error(error_msg)
+        return {"error": error_msg}
     
     try:
-        # Extract model info for progress updates
-        model_name = extract_model_name_from_config(input_data["config"])
-        session_id = f"training_session_{int(time.time())}"
-        
-        # Send initial progress update
-        yield {
-            "status": "starting",
-            "message": f"Starting training for {model_name}",
-            "session_id": session_id,
-            "model_name": model_name,
-            "timestamp": time.time()
-        }
-        
-        # Initialize training handler
         training_handler = TrainingHandler()
-        
-        yield {
-            "status": "initialized",
-            "message": "Training handler initialized",
-            "timestamp": time.time()
-        }
-        
-        # Run training and get final result
         result = training_handler.run_training(
             input_data["config"],
             dataset_config,
             upload_config
         )
-        
-        # Send final result
-        if result.get("success"):
-            yield {
-                "status": "completed",
-                "message": "Training completed successfully! Complete logs available in Supabase.",
-                "result": result,
-                "timestamp": time.time()
-            }
-        else:
-            yield {
-                "status": "failed", 
-                "message": f"Training failed: {result.get('error', 'Unknown error')}",
-                "result": result,
-                "timestamp": time.time()
-            }
-            
+        return result
     except Exception as e:
-        yield {
-            "status": "error",
-            "message": str(e),
-            "timestamp": time.time()
-        }
+        error_msg = f"Handler error: {str(e)}"
+        logger.error(error_msg)
+        return {"error": error_msg}
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting RunPod serverless AI-Toolkit handler...")
+    logger.info("Starting RunPod serverless AI-Toolkit handler...")
     runpod.serverless.start({"handler": handler})
