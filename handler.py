@@ -5,6 +5,7 @@ import logging
 import yaml
 import time
 import sys
+import re
 from pathlib import Path
 from typing import Dict, Any
 import runpod
@@ -51,7 +52,17 @@ class FileUploadHandler(FileSystemEventHandler):
         self.bucket_name = bucket_name
         self.upload_folder = upload_folder
         self.model_name = model_name
-        self.uploaded_files = set()
+        self.uploaded_files = {}  # Track file modification times instead of just existence
+        self.current_step = 0
+        
+    def extract_step_from_logs(self):
+        """Try to extract current training step from recent logs"""
+        # This will be updated by the training handler when it detects step information
+        return self.current_step
+    
+    def update_current_step(self, step):
+        """Update the current training step"""
+        self.current_step = step
         
     def on_created(self, event):
         if not event.is_directory:
@@ -63,32 +74,60 @@ class FileUploadHandler(FileSystemEventHandler):
             
     def handle_file(self, file_path):
         try:
-            time.sleep(2)
+            # Small delay to ensure file is fully written
+            time.sleep(3)
             
-            if file_path in self.uploaded_files:
-                return
-                
             if not file_path.exists() or file_path.stat().st_size == 0:
                 return
                 
+            # Check file modification time to detect if it's actually new/changed
+            current_mtime = file_path.stat().st_mtime
+            last_mtime = self.uploaded_files.get(str(file_path), 0)
+            
+            # Only process if file is new or has been modified
+            if current_mtime <= last_mtime:
+                return
+                
             if self.should_upload(file_path):
+                # Generate proper filename with step information
+                new_filename = self.generate_step_filename(file_path)
+                
                 if file_path.suffix in ['.png', '.jpg', '.jpeg', '.webp']:
-                    remote_path = f"{self.upload_folder}/{self.model_name}/samples/{file_path.name}"
+                    remote_path = f"{self.upload_folder}/{self.model_name}/samples/{new_filename}"
                 elif file_path.suffix == '.safetensors':
-                    remote_path = f"{self.upload_folder}/{self.model_name}/checkpoints/{file_path.name}"
+                    remote_path = f"{self.upload_folder}/{self.model_name}/checkpoints/{new_filename}"
                 elif file_path.suffix in ['.log', '.txt']:
-                    remote_path = f"{self.upload_folder}/{self.model_name}/logs/{file_path.name}"
+                    remote_path = f"{self.upload_folder}/{self.model_name}/logs/{new_filename}"
                 elif file_path.suffix in ['.yaml', '.yml']:
-                    remote_path = f"{self.upload_folder}/{self.model_name}/config/{file_path.name}"
+                    remote_path = f"{self.upload_folder}/{self.model_name}/config/{new_filename}"
                 else:
-                    remote_path = f"{self.upload_folder}/{self.model_name}/outputs/{file_path.name}"
+                    remote_path = f"{self.upload_folder}/{self.model_name}/outputs/{new_filename}"
                 
                 if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
-                    self.uploaded_files.add(file_path)
-                    logger.info(f"UPLOADED: {file_path.name} -> {remote_path}")
+                    # Update the modification time tracker
+                    self.uploaded_files[str(file_path)] = current_mtime
+                    logger.info(f"UPLOADED: {file_path.name} -> {new_filename} (step {self.current_step})")
                     
         except Exception as e:
             logger.error(f"UPLOAD ERROR: {str(e)}")
+    
+    def generate_step_filename(self, file_path):
+        """Generate filename with model name and step number"""
+        extension = file_path.suffix
+        
+        if file_path.suffix in ['.png', '.jpg', '.jpeg', '.webp']:
+            # For sample images: model-name_step_0001.png
+            return f"{self.model_name}_step_{self.current_step:04d}{extension}"
+        elif file_path.suffix == '.safetensors':
+            # For checkpoints: model-name_step_0100.safetensors
+            return f"{self.model_name}_step_{self.current_step:04d}{extension}"
+        else:
+            # For other files, keep original name but add step if not already present
+            stem = file_path.stem
+            if f"step_{self.current_step:04d}" not in stem:
+                return f"{self.model_name}_step_{self.current_step:04d}_{stem}{extension}"
+            else:
+                return file_path.name
             
     def should_upload(self, file_path):
         upload_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.safetensors', '.log', '.txt', '.yaml', '.yml'}
@@ -100,6 +139,7 @@ class TrainingHandler:
         self.workspace = Path("/workspace")
         self.training_dir = self.workspace / "training"
         self.training_dir.mkdir(exist_ok=True)
+        self.file_observer = None
         
         self.ai_toolkit_dir = Path("/app/ai-toolkit")
         self.run_script = self.ai_toolkit_dir / "run.py"
@@ -166,7 +206,32 @@ class TrainingHandler:
         observer.schedule(event_handler, str(output_dir), recursive=True)
         observer.start()
         
+        # Store reference to the event handler so we can update step information
+        self.file_upload_handler = event_handler
+        
         return observer
+
+    def extract_step_from_line(self, line):
+        """Extract step number from training output line"""
+        # Common patterns for step detection
+        step_patterns = [
+            r'Step\s*(\d+)',
+            r'step\s*(\d+)',
+            r'STEP\s*(\d+)',
+            r'Epoch\s*\d+/\d+\s*\|\s*(\d+)/\d+',
+            r'(\d+)/\d+\s*\[',
+            r'step_(\d+)',
+        ]
+        
+        for pattern in step_patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                try:
+                    return int(match.group(1))
+                except (ValueError, IndexError):
+                    continue
+        
+        return None
 
     def run_training(self, config_content: str, dataset_config: Dict[str, Any], 
                     upload_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,7 +295,7 @@ class TrainingHandler:
             os.chdir(str(self.ai_toolkit_dir))
             
             try:
-                # KEY CHANGE: Stream ALL output directly to stdout/stderr in real-time
+                # Stream ALL output directly to stdout/stderr in real-time
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -242,14 +307,21 @@ class TrainingHandler:
                 
                 logger.info("Training process started successfully")
                 
-                # Stream EVERY line directly to stdout (which goes to worker logs)
+                # Stream EVERY line and extract step information
                 while True:
                     output = process.stdout.readline()
                     if output == '' and process.poll() is not None:
                         break
                     if output:
+                        line = output.rstrip()
+                        
+                        # Extract step information and update file handler
+                        step = self.extract_step_from_line(line)
+                        if step is not None and hasattr(self, 'file_upload_handler'):
+                            self.file_upload_handler.update_current_step(step)
+                        
                         # Print directly to stdout - this goes straight to worker logs
-                        print(output.rstrip(), flush=True)
+                        print(line, flush=True)
                         sys.stdout.flush()  # Force immediate output
                 
                 # Get any remaining output
@@ -263,8 +335,9 @@ class TrainingHandler:
                 if return_code == 0:
                     logger.info("Training completed successfully!")
                     
-                    # Wait for final file uploads
-                    time.sleep(30)
+                    # Wait for final file uploads with longer delay for final checkpoint
+                    logger.info("Waiting for final file uploads...")
+                    time.sleep(60)  # Longer wait for final checkpoint
                     
                     return {
                         "success": True,
