@@ -52,17 +52,22 @@ class FileUploadHandler(FileSystemEventHandler):
         self.bucket_name = bucket_name
         self.upload_folder = upload_folder
         self.model_name = model_name
-        self.uploaded_files = {}  # Track file modification times instead of just existence
+        self.last_upload_times = {}  # Track last upload time for each file
         self.current_step = 0
+        self.upload_delay = 3  # seconds to avoid duplicate uploads
         
-    def extract_step_from_logs(self):
-        """Try to extract current training step from recent logs"""
-        # This will be updated by the training handler when it detects step information
-        return self.current_step
-    
     def update_current_step(self, step):
         """Update the current training step"""
         self.current_step = step
+        
+    def can_upload_file(self, file_path):
+        """Check if enough time has passed since last upload attempt"""
+        now = time.time()
+        last_time = self.last_upload_times.get(str(file_path), 0)
+        if now - last_time > self.upload_delay:
+            self.last_upload_times[str(file_path)] = now
+            return True
+        return False
         
     def on_created(self, event):
         if not event.is_directory:
@@ -75,59 +80,56 @@ class FileUploadHandler(FileSystemEventHandler):
     def handle_file(self, file_path):
         try:
             # Small delay to ensure file is fully written
-            time.sleep(3)
+            time.sleep(2)
             
-            if not file_path.exists() or file_path.stat().st_size == 0:
+            if not file_path.exists():
                 return
                 
-            # Check file modification time to detect if it's actually new/changed
-            current_mtime = file_path.stat().st_mtime
-            last_mtime = self.uploaded_files.get(str(file_path), 0)
-            
-            # Only process if file is new or has been modified
-            if current_mtime <= last_mtime:
+            # Check if file has meaningful content
+            if file_path.stat().st_size == 0:
+                return
+                
+            # Avoid duplicate uploads using time-based filtering
+            if not self.can_upload_file(file_path):
                 return
                 
             if self.should_upload(file_path):
-                # Generate proper filename with step information
-                new_filename = self.generate_step_filename(file_path)
+                # Generate proper filename
+                new_filename = self.generate_proper_filename(file_path)
                 
-                if file_path.suffix in ['.png', '.jpg', '.jpeg', '.webp']:
+                if file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
                     remote_path = f"{self.upload_folder}/{self.model_name}/samples/{new_filename}"
-                elif file_path.suffix == '.safetensors':
+                elif file_path.suffix.lower() == '.safetensors':
                     remote_path = f"{self.upload_folder}/{self.model_name}/checkpoints/{new_filename}"
-                elif file_path.suffix in ['.log', '.txt']:
-                    remote_path = f"{self.upload_folder}/{self.model_name}/logs/{new_filename}"
-                elif file_path.suffix in ['.yaml', '.yml']:
+                elif file_path.name == 'config.yaml':
                     remote_path = f"{self.upload_folder}/{self.model_name}/config/{new_filename}"
+                elif file_path.suffix.lower() in ['.log', '.txt']:
+                    remote_path = f"{self.upload_folder}/{self.model_name}/logs/{new_filename}"
                 else:
                     remote_path = f"{self.upload_folder}/{self.model_name}/outputs/{new_filename}"
                 
                 if self.training_handler.upload_file_to_supabase(file_path, self.bucket_name, remote_path):
-                    # Update the modification time tracker
-                    self.uploaded_files[str(file_path)] = current_mtime
-                    logger.info(f"UPLOADED: {file_path.name} -> {new_filename} (step {self.current_step})")
+                    logger.info(f"✅ UPLOADED: {file_path.name} -> {new_filename} (step {self.current_step})")
                     
         except Exception as e:
-            logger.error(f"UPLOAD ERROR: {str(e)}")
+            logger.error(f"❌ UPLOAD ERROR for {file_path}: {str(e)}")
     
-    def generate_step_filename(self, file_path):
-        """Generate filename with model name and step number"""
-        extension = file_path.suffix
+    def generate_proper_filename(self, file_path):
+        """Generate filename with model name and step number, but keep config.yaml unchanged"""
+        if file_path.name == 'config.yaml':
+            return 'config.yaml'  # Keep config.yaml unchanged
+            
+        extension = file_path.suffix.lower()
         
-        if file_path.suffix in ['.png', '.jpg', '.jpeg', '.webp']:
-            # For sample images: model-name_step_0001.png
+        if extension in ['.png', '.jpg', '.jpeg', '.webp']:
+            # Sample images: model-name_step_0001.png
             return f"{self.model_name}_step_{self.current_step:04d}{extension}"
-        elif file_path.suffix == '.safetensors':
-            # For checkpoints: model-name_step_0100.safetensors
+        elif extension == '.safetensors':
+            # Checkpoints: model-name_step_0100.safetensors
             return f"{self.model_name}_step_{self.current_step:04d}{extension}"
         else:
-            # For other files, keep original name but add step if not already present
-            stem = file_path.stem
-            if f"step_{self.current_step:04d}" not in stem:
-                return f"{self.model_name}_step_{self.current_step:04d}_{stem}{extension}"
-            else:
-                return file_path.name
+            # For other files, keep original name
+            return file_path.name
             
     def should_upload(self, file_path):
         upload_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.safetensors', '.log', '.txt', '.yaml', '.yml'}
@@ -139,7 +141,7 @@ class TrainingHandler:
         self.workspace = Path("/workspace")
         self.training_dir = self.workspace / "training"
         self.training_dir.mkdir(exist_ok=True)
-        self.file_observer = None
+        self.file_upload_handler = None
         
         self.ai_toolkit_dir = Path("/app/ai-toolkit")
         self.run_script = self.ai_toolkit_dir / "run.py"
@@ -148,11 +150,11 @@ class TrainingHandler:
             raise ValueError(f"AI Toolkit not found at expected location: {self.ai_toolkit_dir}")
 
     def download_dataset(self, bucket_name: str, dataset_folder: str, local_path: Path):
-        logger.info(f"Downloading dataset from {bucket_name}/{dataset_folder}")
+        logger.info(f"📥 Downloading dataset from {bucket_name}/{dataset_folder}")
         try:
             files = self.supabase.storage.from_(bucket_name).list(dataset_folder)
             if not files:
-                logger.warning(f"No files found in {bucket_name}/{dataset_folder}")
+                logger.warning(f"⚠️ No files found in {bucket_name}/{dataset_folder}")
                 return
 
             local_path.mkdir(parents=True, exist_ok=True)
@@ -167,11 +169,10 @@ class TrainingHandler:
                     with open(local_file_path, 'wb') as f:
                         f.write(response)
                     download_count += 1
-                    logger.info(f"Downloaded: {file_info['name']} ({download_count}/{len(files)})")
             
-            logger.info(f"Dataset download completed: {download_count} files downloaded")
+            logger.info(f"✅ Dataset download completed: {download_count} files")
         except Exception as e:
-            logger.error(f"Error downloading dataset: {str(e)}")
+            logger.error(f"❌ Error downloading dataset: {str(e)}")
             raise
 
     def upload_file_to_supabase(self, local_file: Path, bucket_name: str, remote_path: str):
@@ -184,22 +185,23 @@ class TrainingHandler:
                     remote_path, file_data,
                     file_options={"content-type": "application/octet-stream"}
                 )
+                return True
             except Exception as upload_error:
                 if "already exists" in str(upload_error).lower():
                     response = self.supabase.storage.from_(bucket_name).update(
                         remote_path, file_data,
                         file_options={"content-type": "application/octet-stream"}
                     )
+                    return True
                 else:
                     raise upload_error
 
-            return response
         except Exception as e:
-            logger.error(f"Upload error for {local_file}: {str(e)}")
-            return None
+            logger.error(f"❌ Upload error for {local_file}: {str(e)}")
+            return False
 
     def setup_realtime_file_watcher(self, output_dir: Path, bucket_name: str, upload_folder: str, model_name: str):
-        logger.info(f"Setting up real-time file watcher for {output_dir}")
+        logger.info(f"👀 Setting up file monitoring for {output_dir}")
         
         event_handler = FileUploadHandler(self, output_dir, bucket_name, upload_folder, model_name)
         observer = Observer()
@@ -213,14 +215,17 @@ class TrainingHandler:
 
     def extract_step_from_line(self, line):
         """Extract step number from training output line"""
-        # Common patterns for step detection
+        # Common patterns for step detection in AI training logs
         step_patterns = [
             r'Step\s*(\d+)',
             r'step\s*(\d+)',
             r'STEP\s*(\d+)',
-            r'Epoch\s*\d+/\d+\s*\|\s*(\d+)/\d+',
+            r'Epoch\s*\d+.*?Step\s*(\d+)',
             r'(\d+)/\d+\s*\[',
             r'step_(\d+)',
+            r'save.*step[_\-](\d+)',
+            r'checkpoint.*step[_\-](\d+)',
+            r'\bstep:\s*(\d+)',
         ]
         
         for pattern in step_patterns:
@@ -244,8 +249,8 @@ class TrainingHandler:
             session_dir = self.training_dir / session_id
             session_dir.mkdir(exist_ok=True)
             
-            logger.info(f"Starting training session {session_id}")
-            logger.info(f"Model name: {model_name}")
+            logger.info(f"🚀 Starting training session {session_id}")
+            logger.info(f"📋 Model: {model_name}")
             
             config_file = session_dir / "config.yaml"
             with open(config_file, 'w') as f:
@@ -289,7 +294,7 @@ class TrainingHandler:
                 str(config_file)
             ]
             
-            logger.info(f"Executing command: {' '.join(cmd)}")
+            logger.info(f"💻 Starting training: {' '.join(cmd)}")
             
             original_cwd = os.getcwd()
             os.chdir(str(self.ai_toolkit_dir))
@@ -305,7 +310,7 @@ class TrainingHandler:
                     universal_newlines=True
                 )
                 
-                logger.info("Training process started successfully")
+                logger.info("✅ Training process started")
                 
                 # Stream EVERY line and extract step information
                 while True:
@@ -317,8 +322,9 @@ class TrainingHandler:
                         
                         # Extract step information and update file handler
                         step = self.extract_step_from_line(line)
-                        if step is not None and hasattr(self, 'file_upload_handler'):
+                        if step is not None and self.file_upload_handler:
                             self.file_upload_handler.update_current_step(step)
+                            logger.info(f"📊 Training step updated: {step}")
                         
                         # Print directly to stdout - this goes straight to worker logs
                         print(line, flush=True)
@@ -333,11 +339,11 @@ class TrainingHandler:
                 return_code = process.poll()
                 
                 if return_code == 0:
-                    logger.info("Training completed successfully!")
+                    logger.info("🎉 Training completed successfully!")
                     
-                    # Wait for final file uploads with longer delay for final checkpoint
-                    logger.info("Waiting for final file uploads...")
-                    time.sleep(60)  # Longer wait for final checkpoint
+                    # Wait longer for final file uploads (checkpoints can be large)
+                    logger.info("⏳ Waiting for final file uploads...")
+                    time.sleep(90)  # Extended wait for final checkpoint
                     
                     return {
                         "success": True,
@@ -348,7 +354,7 @@ class TrainingHandler:
                         "output_path": str(output_dir)
                     }
                 else:
-                    logger.error(f"Training failed with return code: {return_code}")
+                    logger.error(f"❌ Training failed with return code: {return_code}")
                     return {
                         "success": False,
                         "error": f"Training process failed with return code {return_code}",
@@ -362,7 +368,7 @@ class TrainingHandler:
                     file_observer.join()
                     
         except Exception as e:
-            logger.error(f"Error in training process: {str(e)}")
+            logger.error(f"❌ Error in training process: {str(e)}")
             if file_observer:
                 file_observer.stop()
                 file_observer.join()
@@ -374,7 +380,7 @@ class TrainingHandler:
 
 def handler(event):
     input_data = event.get("input", {})
-    logger.info(f"Received training request")
+    logger.info(f"📨 Received training request")
     
     required_fields = ["config", "dataset_config", "upload_config"]
     for field in required_fields:
@@ -409,5 +415,5 @@ def handler(event):
         return {"error": error_msg}
 
 if __name__ == "__main__":
-    logger.info("Starting RunPod serverless AI-Toolkit handler...")
+    logger.info("🚀 Starting RunPod serverless AI-Toolkit handler...")
     runpod.serverless.start({"handler": handler})
