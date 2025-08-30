@@ -157,7 +157,7 @@ class TrainingHandler:
             return False
 
     def setup_realtime_file_watcher(self, output_dir: Path, bucket_name: str, upload_folder: str):
-        # Removed the log about setting up real-time watcher
+        
         event_handler = FileUploadHandler(self, output_dir, bucket_name, upload_folder)
         observer = Observer()
         observer.schedule(event_handler, str(output_dir), recursive=True)
@@ -236,7 +236,7 @@ class TrainingHandler:
                     time.sleep(10)
                     return {
                         "success": True,
-                        "message": "Training completed successfully with real-time file uploads",
+                        "message": "Training completed successfully",
                         "session_id": session_id,
                         "model_name": model_name,
                         "upload_folder": upload_config["folder_path"],
