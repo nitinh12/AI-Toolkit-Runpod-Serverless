@@ -1,6 +1,4 @@
-[AI Training Handler for RunPod Serverless - README.md]
-
-# AI Training Handler for RunPod Serverless - README
+# Runpod Serverless Handler for AI Toolkit
 
 ## Overview
 
