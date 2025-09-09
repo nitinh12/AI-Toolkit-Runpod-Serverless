@@ -1,5 +1,4 @@
-[AI Training Handler for RunPod Serverless - README.md](https://github.com/user-attachments/files/22233899/AI.Training.Handler.for.RunPod.Serverless.-.README.md)
-<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
+[AI Training Handler for RunPod Serverless - README.md]
 
 # AI Training Handler for RunPod Serverless - README
 
@@ -193,9 +192,4 @@ This handler leverages:
 ***
 
 *This is a production-ready, custom-built solution for automated AI training with integrated storage management on RunPod's serverless infrastructure.*
-<span style="display:none">[^1]</span>
-
-<div style="text-align: center">⁂</div>
-
-[^1]: handler.py
-
+<span style="display:none">
