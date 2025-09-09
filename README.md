@@ -168,7 +168,6 @@ SUPABASE_SERVICE_KEY=your_service_key_here
 - **Fully custom code** - Not based on RunPod templates
 - **Real-time uploads** - Uses file system events, not polling
 - **Subprocess management** - Direct integration with AI Toolkit
-- **Error resilience** - Continues operation if individual file uploads fail
 
 
 ## RunPod Integration
